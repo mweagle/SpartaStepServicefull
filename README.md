@@ -11,7 +11,9 @@ image of this application to ECR and then to Fargate.
 1. `S3_BUCKET=YOUR_S3_BUCKET mage provision`
 1. Visit the AWS Console and test your Step function!
 
-<div align="center"><img src="https://raw.githubusercontent.com/mweagle/SpartaStepServicefull/master/step_functions_fargate.jpg" />
+<div align="center">
+<img src="https://raw.githubusercontent.com/mweagle/SpartaStepServicefull/master/step_functions_fargate.jpg" />
+</div>
 
 ## Example
 
