@@ -5,36 +5,30 @@ package bootstrap
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/aws/aws-sdk-go/aws/session"
 	sparta "github.com/mweagle/Sparta"
 	spartaCF "github.com/mweagle/Sparta/aws/cloudformation"
+	spartaIAM "github.com/mweagle/Sparta/aws/iam"
+	iamBuilder "github.com/mweagle/Sparta/aws/iam/builder"
 	spartaStep "github.com/mweagle/Sparta/aws/step"
 	spartaDocker "github.com/mweagle/Sparta/docker"
 	gocf "github.com/mweagle/go-cloudformation"
+	"github.com/pkg/errors"
 	"github.com/sirupsen/logrus"
 )
 
 const (
 	// contextKeyImageTag is the docker image tag to use for the task provider
-	contextKeyImageTag string = "ctxKeyImageTag"
+	contextKeyImageTag string = "imageTag"
 	// contextKeyImageURL is the docker URL in the context to use for the fargate task
-	contextKeyImageURL string = "ctxKeyImageURL"
+	contextKeyImageURL string = "imageURL"
 )
 
-func policyStatement(resource gocf.Stringable, actions ...string) gocf.IAMPolicyStatement {
-	statement := gocf.IAMPolicyStatement{
-		Effect:   "Allow",
-		Resource: gocf.StringList(resource),
-	}
-	actionList := make([]gocf.Stringable, len(actions))
-	for index, eachAction := range actions {
-		actionList[index] = gocf.String(eachAction)
-	}
-	statement.Action = gocf.StringList(actionList...)
-	return statement
-}
-
+// Utility function to create logical
+// CloudFormation Resource names that are stable
+// across builds.
 func resourceName(baseName string) string {
 	return sparta.CloudFormationResourceName(baseName, baseName)
 }
@@ -71,12 +65,13 @@ func newStackResourceNames() *stackResourceNames {
 		RouteViaIgw:               resourceName("RouteViaIgw"),
 		PublicRouteViaIgw:         resourceName("PublicRouteViaIgw"),
 		ECSSecurityGroup:          resourceName("ECSSecurityGroup"),
-		PublicSubnetAzs: []string{resourceName("PubSubnetAz1"),
+		PublicSubnetAzs: []string{
+			resourceName("PubSubnetAz1"),
 			resourceName("PubSubnetAz2")},
 	}
 }
 
-func fargateTaskBuilderDecorator(ecrRepositoryName string) sparta.ServiceDecoratorHookHandler {
+func ecrImageBuilderDecorator(ecrRepositoryName string) sparta.ServiceDecoratorHookHandler {
 	decorator := func(context map[string]interface{},
 		serviceName string,
 		template *gocf.Template,
@@ -88,8 +83,14 @@ func fargateTaskBuilderDecorator(ecrRepositoryName string) sparta.ServiceDecorat
 		logger *logrus.Logger) error {
 		dockerServiceName := strings.ToLower(serviceName)
 		dockerTags := make(map[string]string, 0)
-		dockerTags[dockerServiceName] = buildID
-		buildTag := fmt.Sprintf("%s:%s", dockerServiceName, buildID)
+
+		// We use a nonce build id since normally this wouldn't cause a
+		// new image URL because the build ID is a stable git SHA. Using a stable
+		// ID causes CloudFormation to understandably reject the update request,
+		// so add a bit of sugar.
+		nonceBuildID := fmt.Sprintf("%s.%d", buildID, time.Now().Unix())
+		dockerTags[dockerServiceName] = nonceBuildID
+		buildTag := fmt.Sprintf("%s:%s", dockerServiceName, nonceBuildID)
 		context[contextKeyImageTag] = buildTag
 
 		// Always build the image
@@ -113,11 +114,13 @@ func fargateTaskBuilderDecorator(ecrRepositoryName string) sparta.ServiceDecorat
 			}
 			ecrURL = ecrURLPush
 			logger.WithFields(logrus.Fields{
-				"ECRUrl":    ecrURL,
-				"PushError": pushImageErr,
+				"ECRUrl": ecrURL,
 			}).Info("Docker image pushed")
 		} else {
 			ecrURL = fmt.Sprintf("https://123412341234.dkr.ecr.aws-region.amazonaws.com/%s", buildTag)
+			logger.WithFields(logrus.Fields{
+				"ECRUrl": ecrURL,
+			}).Info("Using Docker mock ECR URL due to -n/--noop argument")
 		}
 		// Save the URL
 		context[contextKeyImageURL] = ecrURL
@@ -127,8 +130,8 @@ func fargateTaskBuilderDecorator(ecrRepositoryName string) sparta.ServiceDecorat
 
 }
 
-// fargateClusterDecorator returns a template decorator
-// that defines a Fargate cluster
+// fargateClusterDecorator returns a ServiceDecoratorHookHandler that
+// that provisions an ECS cluster that can run the Fargate task
 func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDecoratorHookHandler {
 	decorator := func(context map[string]interface{},
 		serviceName string,
@@ -144,18 +147,10 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 		ecsRunTaskRole := &gocf.IAMRole{}
 		ecsRunTaskRole.AssumeRolePolicyDocument = map[string]interface{}{
 			"Version": "2012-10-17",
-			"Statement": []gocf.IAMPolicyStatement{
-				gocf.IAMPolicyStatement{
-					Effect: "Allow",
-					Action: gocf.StringList(
-						gocf.String("sts:AssumeRole"),
-					),
-					Principal: &gocf.IAMPrincipal{
-						Service: gocf.StringList(
-							gocf.String("states.amazonaws.com"),
-						),
-					},
-				},
+			"Statement": []spartaIAM.PolicyStatement{
+				iamBuilder.Allow("sts:AssumeRole").
+					ForPrincipals("states.amazonaws.com").
+					ToPolicyStatement(),
 			},
 		}
 		ecsRunTaskRole.Path = gocf.String("/")
@@ -164,26 +159,32 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 				PolicyName: gocf.String("FargateTaskNotificationAccessPolicy"),
 				PolicyDocument: map[string]interface{}{
 					"Version": "2012-10-17",
-					"Statement": []gocf.IAMPolicyStatement{
-						policyStatement(gocf.Ref(resourceNames.SNSTopic),
-							"sns:Publish"),
-						policyStatement(gocf.Ref(resourceNames.ECSTaskDefinition),
-							"ecs:RunTask"),
-						policyStatement(gocf.String("*"),
-							"iam:PassRole",
+					"Statement": []spartaIAM.PolicyStatement{
+						iamBuilder.Allow("sns:Publish").
+							ForResource().
+							Ref(resourceNames.SNSTopic).
+							ToPolicyStatement(),
+						iamBuilder.Allow("ecs:RunTask").
+							ForResource().
+							Ref(resourceNames.ECSTaskDefinition).
+							ToPolicyStatement(),
+						iamBuilder.Allow("iam:PassRole",
 							"ecs:StopTask",
-							"ecs:DescribeTasks"),
-						policyStatement(gocf.Join("",
-							gocf.String("arn:"),
-							gocf.Ref("AWS::Partition"),
-							gocf.String(":events:"),
-							gocf.Ref("AWS::Region"),
-							gocf.String(":"),
-							gocf.Ref("AWS::AccountId"),
-							gocf.String(":rule/StepFunctionsGetEventsForECSTaskRule")),
-							"events:PutTargets",
+							"ecs:DescribeTasks").
+							ForResource().
+							Literal("*").
+							ToPolicyStatement(),
+						iamBuilder.Allow("events:PutTargets",
 							"events:PutRule",
-							"events:DescribeRule"),
+							"events:DescribeRule").
+							ForResource().
+							Literal("arn:").
+							Partition().
+							Literal(":events:").
+							Region(":").
+							AccountID().
+							Literal(":rule/StepFunctionsGetEventsForECSTaskRule").
+							ToPolicyStatement(),
 						// Ref: https://docs.aws.amazon.com/AmazonECR/latest/userguide/ECR_on_ECS.html
 					},
 				},
@@ -197,24 +198,21 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 		// ECS TaskDefinition
 		logger.WithField("context", fmt.Sprintf("%#v", context)).Debug("ECS TASK CONTEXT")
 
+		// Get the imageURL from the context. This is the ECR URL to which we
+		// previously pushed the locally built image in the ecrImageBuilderDecorator
+		// step
 		imageURL, _ := context[contextKeyImageURL].(string)
-
+		if imageURL == "" {
+			return errors.Errorf("Failed to get image URL from context with key %s", contextKeyImageURL)
+		}
 		// We need an IAM role to pull images from ECR...
 		ecsTaskDefRole := &gocf.IAMRole{}
 		ecsTaskDefRole.AssumeRolePolicyDocument = map[string]interface{}{
 			"Version": "2012-10-17",
-			"Statement": []gocf.IAMPolicyStatement{
-				gocf.IAMPolicyStatement{
-					Effect: "Allow",
-					Action: gocf.StringList(
-						gocf.String("sts:AssumeRole"),
-					),
-					Principal: &gocf.IAMPrincipal{
-						Service: gocf.StringList(
-							gocf.String("ecs-tasks.amazonaws.com"),
-						),
-					},
-				},
+			"Statement": []spartaIAM.PolicyStatement{
+				iamBuilder.Allow("sts:AssumeRole").
+					ForPrincipals("ecs-tasks.amazonaws.com").
+					ToPolicyStatement(),
 			},
 		}
 		ecsTaskDefRole.Policies = &gocf.IAMRolePolicyList{
@@ -223,21 +221,24 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 				PolicyDocument: map[string]interface{}{
 					"Version": "2012-10-17",
 					// Ref: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/task_execution_IAM_role.html
-					"Statement": []gocf.IAMPolicyStatement{
-						policyStatement(gocf.String("*"),
-							"ecr:GetAuthorizationToken",
+					"Statement": []spartaIAM.PolicyStatement{
+						iamBuilder.Allow("ecr:GetAuthorizationToken",
 							"ecr:BatchCheckLayerAvailability",
 							"ecr:GetDownloadUrlForLayer",
 							"ecr:BatchGetImage",
 							"logs:CreateLogStream",
 							"logs:CreateLogGroup",
-							"logs:PutLogEvents"),
+							"logs:PutLogEvents").
+							ForResource().
+							Literal("*").
+							ToPolicyStatement(),
 					},
 				},
 			},
 		}
 		template.AddResource(resourceNames.ECSTaskDefinitionRole, ecsTaskDefRole)
-		// Create the task def...
+
+		// Create the ECS task definition
 		ecsTaskDefinition := &gocf.ECSTaskDefinition{
 			ExecutionRoleArn:        gocf.GetAtt(resourceNames.ECSTaskDefinitionRole, "Arn"),
 			RequiresCompatibilities: gocf.StringList(gocf.String("FARGATE")),
@@ -251,6 +252,7 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 					Essential: gocf.Bool(true),
 					LogConfiguration: &gocf.ECSTaskDefinitionLogConfiguration{
 						LogDriver: gocf.String("awslogs"),
+						// Options Ref: https://docs.aws.amazon.com/AmazonECS/latest/developerguide/AWS_Fargate.html
 						Options: map[string]interface{}{
 							"awslogs-region": gocf.Ref("AWS::Region"),
 							"awslogs-group": strings.Join([]string{"",
@@ -266,12 +268,13 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 		template.AddResource(resourceNames.ECSTaskDefinition, ecsTaskDefinition)
 
 		// VPC...
-		vpc := gocf.EC2VPC{
+		vpc := &gocf.EC2VPC{
 			CidrBlock:          gocf.String("10.0.0.0/16"),
 			EnableDNSSupport:   gocf.Bool(true),
 			EnableDNSHostnames: gocf.Bool(true),
 		}
 		template.AddResource(resourceNames.VPC, vpc)
+
 		// Subnets
 		for i := 0; i != len(resourceNames.PublicSubnetAzs); i++ {
 			subnet := &gocf.EC2Subnet{
@@ -288,7 +291,8 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 				},
 			}
 			template.AddResource(resourceNames.PublicSubnetAzs[i], subnet)
-			// Link it up...
+
+			// Wire them up...
 			subnetRouteTableAssociation := &gocf.EC2SubnetRouteTableAssociation{
 				SubnetID:     gocf.Ref(resourceNames.PublicSubnetAzs[i]).String(),
 				RouteTableID: gocf.Ref(resourceNames.RouteViaIgw).String(),
@@ -298,6 +302,7 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 		}
 		// InternetGateway
 		template.AddResource(resourceNames.InternetGateway, &gocf.EC2InternetGateway{})
+
 		// AttachGateway
 		template.AddResource(resourceNames.AttachGateway, &gocf.EC2VPCGatewayAttachment{
 			VPCID:             gocf.Ref(resourceNames.VPC).String(),
@@ -307,6 +312,7 @@ func fargateClusterDecorator(resourceNames *stackResourceNames) sparta.ServiceDe
 		template.AddResource(resourceNames.RouteViaIgw, &gocf.EC2RouteTable{
 			VPCID: gocf.Ref(resourceNames.VPC).String(),
 		})
+
 		// PublicRouteViaIgw
 		routeResource := template.AddResource(resourceNames.PublicRouteViaIgw, &gocf.EC2Route{
 			RouteTableID:         gocf.Ref(resourceNames.RouteViaIgw).String(),
@@ -370,8 +376,10 @@ func Run(logger *logrus.Logger) (*sparta.WorkflowHooks, error) {
 	// Add the state machine to the deployment...
 	workflowHooks := &sparta.WorkflowHooks{
 		ServiceDecorators: []sparta.ServiceDecoratorHookHandler{
-			fargateTaskBuilderDecorator("spartadocker"),
+			ecrImageBuilderDecorator("spartadocker"),
+			// Then build the state machine
 			stateMachine.StateMachineDecorator(),
+			// Then the ECS cluster that supports the Fargate task
 			fargateClusterDecorator(resourceNames),
 		},
 	}
